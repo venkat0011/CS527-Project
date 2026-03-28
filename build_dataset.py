@@ -6,8 +6,7 @@ Builds a balanced dataset of 100 true + 100 false per property.
 Only includes folders applicable to both C and Python (transpiled):
     array-*, loops*, loop-*, recursive*, bitvector*, termination-*
 
-Excludes: real-world systems (sqlite, aws, linux drivers), heap/memory,
-          concurrency, hardware, neural networks.
+Only includes plain .c files (skips .i preprocessed files and alloca variants).
 
 Usage:
     python build_dataset.py --sv_benchmarks /path/to/sv-benchmarks --output dataset.csv
@@ -24,7 +23,6 @@ from collections import defaultdict, Counter
 
 import yaml  # pip install pyyaml
 
-# Properties to evaluate (coverage-* excluded — no ground truth verdict)
 TARGET_PROPERTIES = {
     "unreach-call",
     "no-overflow",
@@ -35,8 +33,6 @@ TARGET_PROPERTIES = {
     "termination",
 }
 
-# Only folders whose programs are tractable AND cleanly transpilable to Python.
-# Prefix-matched against the immediate subdirectory name under c/.
 FOLDER_WHITELIST_PREFIXES = (
     "array-",
     "array_",
@@ -54,7 +50,6 @@ RANDOM_SEED = 42
 
 
 def is_whitelisted(yml_path: Path, c_dir: Path) -> bool:
-    """Check if the yml's immediate parent folder under c/ is in the whitelist."""
     try:
         rel = yml_path.relative_to(c_dir)
     except ValueError:
@@ -64,15 +59,10 @@ def is_whitelisted(yml_path: Path, c_dir: Path) -> bool:
 
 
 def property_name_from_path(prp_path: str) -> str:
-    """'../properties/unreach-call.prp' -> 'unreach-call'"""
     return Path(prp_path).stem
 
 
 def parse_yml(yml_path: Path, sv_root: Path):
-    """
-    Parse a single YML file.
-    Returns a list of records for TARGET_PROPERTIES that have an expected_verdict.
-    """
     try:
         with open(yml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
@@ -93,6 +83,13 @@ def parse_yml(yml_path: Path, sv_root: Path):
     input_files = str(input_files)
 
     c_file_abs = (yml_path.parent / input_files).resolve()
+
+    # Only plain .c files — skip .i (preprocessed), alloca variants, and cil files
+    if c_file_abs.suffix != ".c":
+        return []
+    name_lower = c_file_abs.name.lower()
+    if "alloca" in name_lower or ".cil." in name_lower:
+        return []
 
     sv_root_resolved = sv_root.resolve()
     try:
@@ -142,11 +139,13 @@ def build_dataset(sv_benchmarks: Path, output: Path, seed: int = RANDOM_SEED):
 
     c_dir = sv_benchmarks / "c"
     if not c_dir.exists():
-        raise FileNotFoundError(f"Could not find c/ directory under {sv_benchmarks}")
+        raise FileNotFoundError(
+            f"Could not find c/ directory under {sv_benchmarks}")
 
     # Show which folders will be included vs excluded
     all_folders = sorted(p.name for p in c_dir.iterdir() if p.is_dir())
-    included = [f for f in all_folders if f.lower().startswith(FOLDER_WHITELIST_PREFIXES)]
+    included = [f for f in all_folders if f.lower(
+    ).startswith(FOLDER_WHITELIST_PREFIXES)]
     excluded = [f for f in all_folders if f not in included]
     print(f"Total folders under c/: {len(all_folders)}")
     print(f"Included ({len(included)}): {', '.join(included)}")
@@ -168,7 +167,8 @@ def build_dataset(sv_benchmarks: Path, output: Path, seed: int = RANDOM_SEED):
     for prop in sorted(TARGET_PROPERTIES):
         t = len(buckets.get((prop, "true"), []))
         f = len(buckets.get((prop, "false"), []))
-        note = "  *** INSUFFICIENT ***" if (t < SAMPLES_PER_VERDICT or f < SAMPLES_PER_VERDICT) else ""
+        note = "  *** INSUFFICIENT ***" if (
+            t < SAMPLES_PER_VERDICT or f < SAMPLES_PER_VERDICT) else ""
         print(f"  {prop:20s}  true={t:5d}  false={f:5d}{note}")
 
     # Sample and combine
@@ -179,11 +179,13 @@ def build_dataset(sv_benchmarks: Path, output: Path, seed: int = RANDOM_SEED):
             pool = buckets.get((prop, verdict), [])
             n = min(SAMPLES_PER_VERDICT, len(pool))
             sampled = random.sample(pool, n) if n > 0 else []
-            print(f"  {prop:20s}  verdict={verdict}  sampled={n:3d} / available={len(pool)}")
+            print(
+                f"  {prop:20s}  verdict={verdict}  sampled={n:3d} / available={len(pool)}")
             all_rows.extend(sampled)
 
     # Write CSV
-    fieldnames = ["property", "expected_verdict", "c_file", "c_file_abs", "yml_path", "folder"]
+    fieldnames = ["property", "expected_verdict",
+                  "c_file", "c_file_abs", "yml_path", "folder"]
     with open(output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -203,7 +205,8 @@ def build_dataset(sv_benchmarks: Path, output: Path, seed: int = RANDOM_SEED):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build balanced SV-COMP dataset")
+    parser = argparse.ArgumentParser(
+        description="Build balanced SV-COMP dataset")
     parser.add_argument("--sv_benchmarks", type=Path, required=True,
                         help="Path to sv-benchmarks/ root directory")
     parser.add_argument("--output", type=Path, default=Path("dataset.csv"),
