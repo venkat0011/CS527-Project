@@ -1,36 +1,52 @@
 import pandas as pd
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import re
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from tqdm import tqdm
 import os
 
 # --- Configuration ---
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 CSV_PATH = '/workspace/CS527-Project/c_sample.csv'
 BASE_OUTPUT_DIR = '/workspace/CS527-Project/'
 SEEDS = [42, 123, 999]
 TEMPERATURES = [0.2, 0.4, 0.6]
 PROPERTIES_BASE_PATH = '/workspace/sv-benchmarks/c/properties/'
-BATCH_SIZE = 8  # Tune based on your GPU VRAM (lower if OOM)
+BATCH_SIZE = 8
 
-# Load Model and Tokenizer
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+# --- Quantisation Config (4-bit NF4) ---
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)
 
-# ✅ Critical: causal LMs must left-pad so all sequences end at the same position
+# --- Load Model and Tokenizer ---
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 tokenizer.padding_side = "left"
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float16,
-    device_map="auto"
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True
 )
 model.eval()
 
 
+def strip_thinking(text: str) -> str:
+    """Remove DeepSeek R1's <think>...</think> block, keep only the Lean code."""
+    if "</think>" in text:
+        return text.split("</think>", 1)[-1].strip()
+    if "<think>" in text:
+        return re.sub(r"<think>.*", "", text, flags=re.DOTALL).strip()
+    return text.strip()
+
+
 def build_prompt(c_code: str, property_text: str) -> str:
-    """Build the full prompt string (without tokenizing)."""
     messages = [
         {
             "role": "system",
@@ -52,18 +68,17 @@ def build_prompt(c_code: str, property_text: str) -> str:
 
 
 def generate_batch(prompts: list[str], seed: int, temp: float) -> list[str]:
-    """Tokenize a batch of prompts and run generation in one forward pass."""
     torch.manual_seed(seed)
 
     inputs = tokenizer(
         prompts,
         return_tensors="pt",
-        padding=True,          # pad shorter sequences on the LEFT
+        padding=True,
         truncation=True,
-        max_length=3000        # leave headroom for 4000 new tokens
+        max_length=3000
     ).to(model.device)
 
-    input_lengths = inputs["input_ids"].shape[-1]
+    input_length = inputs["input_ids"].shape[-1]
 
     with torch.no_grad():
         outputs = model.generate(
@@ -72,14 +87,17 @@ def generate_batch(prompts: list[str], seed: int, temp: float) -> list[str]:
             temperature=temp,
             do_sample=True,
             pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
-    # Decode only the newly generated tokens for each item
     results = []
-    for i, output in enumerate(outputs):
-        new_tokens = output[input_lengths:]          # strip the shared prompt prefix
-        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-        results.append("import Mathlib\n" + text)
+    for output in outputs:
+        new_tokens = output[input_length:]
+        raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        lean_code = strip_thinking(raw_text)          # strip R1 <think> block
+        if not lean_code.startswith("import Mathlib"):
+            lean_code = "import Mathlib\n" + lean_code
+        results.append(lean_code)
 
     return results
 
@@ -87,13 +105,13 @@ def generate_batch(prompts: list[str], seed: int, temp: float) -> list[str]:
 # --- Main Execution ---
 for temp in TEMPERATURES:
     print(f"\n>>> Starting generation for Temperature: {temp}")
+
     df_temp = pd.read_csv(CSV_PATH)
 
     for s in SEEDS:
         df_temp[f'lean_proof_seed_{s}'] = ""
 
-    # Pre-load all C code and property files once (avoids redundant I/O inside loops)
-    prompts_cache: dict[int, str] = {}   # index -> prompt string
+    prompts_cache: dict[int, str] = {}
     skipped = set()
 
     for index, row in df_temp.iterrows():
@@ -110,8 +128,6 @@ for temp in TEMPERATURES:
 
     valid_indices = [i for i in df_temp.index if i not in skipped]
 
-    # Outer loop: seed  →  Inner loop: batches of rows
-    # This way torch.manual_seed(seed) is set once per batch, keeping results reproducible
     for seed in SEEDS:
         print(f"  Seed {seed} — {len(valid_indices)} rows in batches of {BATCH_SIZE}")
 
@@ -134,7 +150,7 @@ for temp in TEMPERATURES:
 
     output_filename = os.path.join(
         BASE_OUTPUT_DIR,
-        f'mistral_temp_{str(temp).replace(".", "")}.csv'
+        f'deepseek_temp_{str(temp).replace(".", "")}.csv'
     )
     df_temp.to_csv(output_filename, index=False)
     print(f"Saved: {output_filename}")
