@@ -1,145 +1,155 @@
+import gc
+import os
 import pandas as pd
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
-import os
+from vllm import LLM, SamplingParams
+from vllm.distributed.parallel_state import destroy_model_parallel
+from dataclasses import dataclass, field
+from typing import Optional
 
-# --- Configuration ---
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
-CSV_PATH = '/workspace/CS527-Project/c_sample.csv'
-BASE_OUTPUT_DIR = '/workspace/CS527-Project/'
-SEEDS = [42, 123, 999]
-TEMPERATURES = [0.2, 0.4, 0.6]
-PROPERTIES_BASE_PATH = '/workspace/sv-benchmarks/c/properties/'
-BATCH_SIZE = 8  # Tune based on your GPU VRAM (lower if OOM)
+@dataclass
+class RunConfig:
+    csv_path: str             = '/workspace/CS527-Project/c_sample.csv'
+    base_output_dir: str      = '/workspace/CS527-Project/'
+    properties_base_path: str = '/workspace/sv-benchmarks/c/properties/'
+    seeds: list               = field(default_factory=lambda: [42, 123, 999])
+    temperatures: list        = field(default_factory=lambda: [0.2, 0.5, 0.8])
+    top_p: float              = 0.95
+    max_new_tokens: int       = 3000
+    max_model_len: int        = 32768
+    gpu_memory_utilization: float = 0.92
 
-# Load Model and Tokenizer
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+MODEL_REGISTRY = {
+    "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2",
+    # "mistral-7b-awq": "mistralai/Mistral-7B-Instruct-v0.2-AWQ",
+}
 
-# ✅ Critical: causal LMs must left-pad so all sequences end at the same position
-tokenizer.padding_side = "left"
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+cfg = RunConfig()
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.float16,
-    device_map="auto"
-)
-model.eval()
+# ─── MODEL MANAGER ────────────────────────────────────────────────────────────
 
+class ModelManager:
+    def __init__(self):
+        self.llm: Optional[LLM] = None
+        self.current_id: Optional[str] = None
 
-def build_prompt(c_code: str, property_text: str) -> str:
-    """Build the full prompt string (without tokenizing)."""
-    messages = [
-        {
-            "role": "system",
-            "content": "You output only Lean 4 code. No English. No explanations. No self-correction."
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Translate this C code into a Lean 4 proof. Output Lean 4 code only.\n\n"
-                f"## C Code\n```c\n{c_code}\n```\n\n"
-                f"## Specification\n{property_text}\n\n"
-                f"Begin your response with `import Mathlib` and nothing else before it.\n"
-                f"Do not write any English text before or after the Lean 4 code block."
-            )
-        }
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return prompt + "import Mathlib\n"
-
-
-def generate_batch(prompts: list[str], seed: int, temp: float) -> list[str]:
-    """Tokenize a batch of prompts and run generation in one forward pass."""
-    torch.manual_seed(seed)
-
-    inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,          # pad shorter sequences on the LEFT
-        truncation=True,
-        max_length=3000        # leave headroom for 4000 new tokens
-    ).to(model.device)
-
-    input_lengths = inputs["input_ids"].shape[-1]
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=4000,
-            temperature=temp,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
+    def load(self, model_id: str, quantization: Optional[str] = None):
+        if self.current_id == model_id:
+            return
+        self.unload()
+        print(f"\n[ModelManager] Loading {model_id}")
+        self.llm = LLM(
+            model=model_id,
+            dtype="float16",
+            quantization=quantization,
+            gpu_memory_utilization=cfg.gpu_memory_utilization,
+            max_model_len=cfg.max_model_len,
+            trust_remote_code=True,
         )
+        self.current_id = model_id
+        print(f"[ModelManager] Ready. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # Decode only the newly generated tokens for each item
-    results = []
-    for i, output in enumerate(outputs):
-        new_tokens = output[input_lengths:]          # strip the shared prompt prefix
-        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-        results.append("import Mathlib\n" + text)
-
-    return results
-
-
-# --- Main Execution ---
-for temp in TEMPERATURES:
-    print(f"\n>>> Starting generation for Temperature: {temp}")
-    df_temp = pd.read_csv(CSV_PATH)
-
-    for s in SEEDS:
-        df_temp[f'lean_proof_seed_{s}'] = ""
-
-    # Pre-load all C code and property files once (avoids redundant I/O inside loops)
-    prompts_cache: dict[int, str] = {}   # index -> prompt string
-    skipped = set()
-
-    for index, row in df_temp.iterrows():
-        try:
-            with open(row['c_file_abs'], 'r', encoding='utf-8') as f:
-                c_code = f.read()
-            property_path = f"{PROPERTIES_BASE_PATH}{row['property']}.prp"
-            with open(property_path, 'r', encoding='utf-8') as f:
-                prop_text = f.read()
-            prompts_cache[index] = build_prompt(c_code, prop_text)
-        except Exception as e:
-            print(f"  [Skip] Row {index} file read error: {e}")
-            skipped.add(index)
-
-    valid_indices = [i for i in df_temp.index if i not in skipped]
-
-    # Outer loop: seed  →  Inner loop: batches of rows
-    # This way torch.manual_seed(seed) is set once per batch, keeping results reproducible
-    for seed in SEEDS:
-        print(f"  Seed {seed} — {len(valid_indices)} rows in batches of {BATCH_SIZE}")
-
-        for batch_start in tqdm(
-            range(0, len(valid_indices), BATCH_SIZE),
-            desc=f"Temp {temp} | Seed {seed}"
-        ):
-            batch_indices = valid_indices[batch_start : batch_start + BATCH_SIZE]
-            batch_prompts = [prompts_cache[i] for i in batch_indices]
-
-            try:
-                batch_outputs = generate_batch(batch_prompts, seed, temp)
-                for idx, output in zip(batch_indices, batch_outputs):
-                    df_temp.at[idx, f'lean_proof_seed_{seed}'] = output
-            except Exception as e:
-                print(f"  [Error] Batch {batch_start}–{batch_start+len(batch_indices)} seed {seed}: {e}")
-
-        # ✅ Free GPU cache after every seed
+    def unload(self):
+        if self.llm is None:
+            return
+        print(f"[ModelManager] Unloading {self.current_id}")
+        destroy_model_parallel()
+        del self.llm
+        self.llm = None
+        self.current_id = None
+        gc.collect()
         torch.cuda.empty_cache()
+        print(f"[ModelManager] Freed. VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    output_filename = os.path.join(
-        BASE_OUTPUT_DIR,
-        f'mistral_temp_{str(temp).replace(".", "")}.csv'
+manager = ModelManager()
+
+# ─── PROMPT ───────────────────────────────────────────────────────────────────
+
+def build_prompt(c_code: str, prop_text: str) -> str:
+    system = (
+        "You are an expert in formal verification, Lean 4, and Mathlib. "
+        "Think through the problem, then output the complete Lean 4 proof. "
+        "For any proof step you are unsure about, write `sorry` — "
+        "this keeps the file compilable so the Lean checker can verify the rest."
     )
-    df_temp.to_csv(output_filename, index=False)
-    print(f"Saved: {output_filename}")
+    user = (
+        "Translate this C program into a Lean 4 proof of the given property.\n\n"
+        f"C Code:\n```c\n{c_code}\n```\n\n"
+        f"Property:\n{prop_text}\n\n"
+        "Start your response with `import Mathlib`."
+    )
+    return f"[INST] {system}\n\n{user} [/INST]"
 
-# ✅ Fully release model from VRAM when all generations are done
-del model, tokenizer
-torch.cuda.empty_cache()
-print("\nAll generations complete. VRAM released.")
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+def main():
+    df = pd.read_csv(cfg.csv_path)
+
+    raw: dict[int, tuple[str, str]] = {}
+    valid: list[int] = []
+    for idx, row in df.iterrows():
+        try:
+            with open(row['c_file_abs']) as f: c = f.read()
+            with open(f"{cfg.properties_base_path}{row['property']}.prp") as f: p = f.read()
+            raw[idx] = (c, p)
+            valid.append(idx)
+        except Exception as e:
+            print(f"[Skip] {idx}: {e}")
+
+    print(f"[Data] {len(valid)}/{len(df)} files ready.")
+
+    for model_name, model_id in MODEL_REGISTRY.items():
+        print(f"\n{'='*60}\n  {model_name}\n{'='*60}")
+        quant = "awq" if "awq" in model_id.lower() else None
+        manager.load(model_id, quantization=quant)
+
+        prompts = {idx: build_prompt(c, p) for idx, (c, p) in raw.items()}
+        prompt_list = [prompts[i] for i in valid]
+
+        for temp in cfg.temperatures:
+            print(f"\n  temp={temp}")
+            seed_outputs: dict[int, dict[int, str]] = {}  # seed -> {idx -> output}
+
+            for seed in cfg.seeds:
+                print(f"    seed={seed}")
+
+                # ✅ FIX 1: Create fresh SamplingParams per seed with seed actually set
+                sampling_params = SamplingParams(
+                    temperature=temp,
+                    top_p=cfg.top_p,
+                    max_tokens=cfg.max_new_tokens,
+                    n=1,          # 1 output per prompt per seed run
+                    seed=seed,    # ✅ seed is now actually used
+                )
+
+                results = manager.llm.generate(prompt_list, sampling_params)
+
+                # Map each row index to its single generated output
+                seed_outputs[seed] = {
+                    idx: "import Mathlib\n" + r.outputs[0].text
+                    for idx, r in zip(valid, results)
+                }
+
+                del results
+                gc.collect()
+
+            # ✅ FIX 2: One CSV per temperature — each seed becomes its own column
+            df_out = df.copy()
+            for seed in cfg.seeds:
+                df_out[f"sample_seed_{seed}"] = df_out.index.map(
+                    lambda x, s=seed: seed_outputs[s].get(x, "")
+                )
+
+            path = os.path.join(cfg.base_output_dir, f"{model_name}_t{temp}.csv")
+            df_out.to_csv(path, index=False)
+            print(f"  [Saved] {path}  →  columns: {[f'sample_seed_{s}' for s in cfg.seeds]}")
+
+            del seed_outputs, df_out
+            gc.collect()
+
+        manager.unload()
+
+    print("\n[Done]")
+
+if __name__ == "__main__":
+    main()
