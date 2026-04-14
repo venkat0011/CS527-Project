@@ -1,0 +1,77 @@
+Unnamed: 0,property,expected_verdict,c_file,c_file_abs,yml_path,folder,strat_key,lean_proof
+345,termination,False,c/termination-restricted-15/Swingers.c,/workspace/sv-benchmarks/c/termination-restricted-15/Swingers.c,c/termination-restricted-15/Swingers.yml,termination-restricted-15,termination_False_termination-restricted-15,"import Mathlib
+```lean
+import Mathlib
+
+-- Define a simple boolean type
+inductive Bool : Type
+| false : Bool
+| true : Bool
+
+-- Define a function to simulate nondeterministic integer input
+def nondet_int : Bool → Int
+| Bool.false => 13
+| Bool.true => 17
+
+-- Define the main function logic
+def main (init_bob : Int) (init_samantha : Int) : List Int × List Int :=
+let rec loop (bob : Int) (samantha : Int) (bob_history : List Int) (samantha_history : List Int) : List Int × List Int :=
+  if bob + samantha < 100 then
+    let temp := bob;
+    loop samantha temp (bob :: bob_history) (samantha :: samantha_history)
+  else
+    (bob_history, samantha_history)
+in
+loop init_bob init_samantha [] []
+
+-- Define the initial values
+def init_bob := 13
+def init_samantha := 17
+
+-- Run the main function with the initial values
+def result := main init_bob init_samantha
+
+-- Property: The loop will eventually terminate (F end)
+example : ∃ (bob_hist : List Int) (samantha_hist : List Int), result = (bob_hist, samantha_hist) :=
+begin
+  -- The loop will terminate because bob + samantha will eventually not be less than 100
+  sorry
+end
+```
+```"
+372,termination,False,c/bitvector/jain_4-2.c,/workspace/sv-benchmarks/c/bitvector/jain_4-2.c,c/bitvector/jain_4-2.yml,bitvector,termination_False_bitvector,"import Mathlib
+```lean
+import Mathlib
+
+def main : IO Unit := do
+  -- Define the variables
+  let mut x := 0
+  let mut y := 0
+  let mut z := 0
+
+  -- Infinite loop
+  let rec loop : IO Unit := do
+    -- Nondeterministic updates
+    let nondet1 := IO.mklift (pure (0 : Nat)) -- Placeholder for nondeterministic value
+    let nondet2 := IO.mklift (pure (0 : Nat)) -- Placeholder for nondeterministic value
+    let nondet3 := IO.mklift (pure (0 : Nat)) -- Placeholder for nondeterministic value
+
+    -- Update x, y, z
+    x := x + 4 * nondet1
+    y := y + 4 * nondet2
+    z := z + 8 * nondet3
+
+    -- Assert that x + y + z ≠ 1
+    if x + y + z = 1 then
+      IO.println ""Assertion failed: x + y + z ≠ 1""
+      IO.exit 1
+    else
+      loop
+
+  -- Start the loop
+  loop
+
+-- Property to check: LTL(F end)
+-- This property is not directly expressible in Lean as a proof, but the assertion within the loop serves as a safety check.
+-- The loop will terminate with an error if the condition x + y + z ≠ 1 is violated.
+```"

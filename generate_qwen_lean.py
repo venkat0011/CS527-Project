@@ -21,8 +21,8 @@ class RunConfig:
     gpu_memory_utilization: float = 0.92
 
 MODEL_REGISTRY = {
-    "deepseek-r1-14b": {
-        "model_id":             "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+    "qwen2.5-32b": {
+        "model_id":             "Qwen/Qwen2.5-32B-Instruct",
         "prompt_format":        "chatml",
         "dtype":                "bfloat16",
         "tensor_parallel_size": 1,
@@ -161,7 +161,7 @@ def extract_proof(generated_text: str) -> str:
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    df = pd.read_csv(cfg.csv_path).sample(2)
+    df = pd.read_csv(cfg.csv_path)
     raw: dict[int, tuple[str, str]] = {}
     valid: list[int] = []
     for idx, row in df.iterrows():
