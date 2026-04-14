@@ -16,14 +16,14 @@ class RunConfig:
     seeds: list                   = field(default_factory=lambda: [42, 123, 999])
     temperatures: list            = field(default_factory=lambda: [0.2, 0.5, 0.8])
     top_p: float                  = 0.95
-    max_new_tokens: int           = 3000
+    max_new_tokens: int           = 3000 # it is reasoning and not providing the proof at all 
     max_model_len: int            = 32768
     gpu_memory_utilization: float = 0.92
 
 MODEL_REGISTRY = {
-    "deepseek-r1-14b": {
-        "model_id":             "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
-        "prompt_format":        "chatml",
+    "goedel-prover-8b": {
+        "model_id":             "Goedel-LM/Goedel-Code-Prover-8B",
+        "prompt_format":        "chatml",   # ← correct, it's Qwen2.5-based
         "dtype":                "bfloat16",
         "tensor_parallel_size": 1,
         "quantization":         None,
