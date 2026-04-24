@@ -34,7 +34,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Clients pointing to persistent vLLM servers
 q_client = OpenAI(base_url="http://localhost:8000/v1", api_key="vllm-token")
-gpt_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key="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")
+gpt_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key="")
 
 # ─── SIMILARITY LOGIC (BLEU) ──────────────────────────────────────────────────
 
