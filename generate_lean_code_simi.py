@@ -11,7 +11,7 @@ from functools import lru_cache
 INPUT_DIR = "/workspace/CS527-Project/raw_lean_proofs"
 OUTPUT_DIR = "/workspace/CS527-Project/representativeness_results"
 GPT_MODEL = "openai/gpt-5.1-codex-mini"
-API_KEY = "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"  # Keep your key secret
+API_KEY = ""  # Keep your key secret
 SEEDS = ["42", "123", "999"]
 MAX_WORKERS = 20  # Increase this based on your OpenRouter tier limits
 
