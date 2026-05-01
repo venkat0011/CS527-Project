@@ -1,27 +1,33 @@
-```python
 #!/usr/bin/env python3
 """
 pipeline_neg_dual.py
 
-Two new experiment modes — use alongside existing pipeline1_direct.py results:
+MODEL       : deepseek/deepseek-v4-flash  (via OpenRouter → SiliconFlow)
+TEMPERATURE : 0.2
+MODES       : negative | dual
 
-  MODE "negative" : Always try to DISPROVE the specification.
-                    Lean proof shows a concrete VIOLATION / COUNTEREXAMPLE.
-                    Predicts False if negation proof succeeds, True if it fails.
+Key optimisations over base version:
+  • include_reasoning=False  — strips <think> tokens from output (reasoning
+                               still happens server-side, quality preserved,
+                               tokens_out drops from ~50k to ~2k per call)
+  • Provider routing          — forces SiliconFlow (68 tps) not Parasail (20 tps)
+  • Streaming + early stop    — connection closed the moment ===END LEAN PROOF===
+                               appears; no waiting for trailing text
+  • client timeout=120s       — hard limit per HTTP call, prevents silent hangs
+  • Full 10-iteration context — no history trimming, all repair rounds in context
 
-  MODE "dual"     : Run positive AND negative in parallel (10 iterations each).
-                    Priority: negation proven → False
-                              positive proven (negation failed) → True
-                              both failed → False  (conservative default)
+MODE "negative" : Prove the spec is VIOLATED.
+                  Predicts False if negation proves, True if negation fails.
 
-Decision table:
-  ┌─────────────────┬────────────────┬────────────┐
-  │  neg succeeded  │ pos succeeded  │ prediction │
-  ├─────────────────┼────────────────┼────────────┤
-  │      True       │    anything    │   False    │  ← trust negative
-  │      False      │      True      │   True     │
-  │      False      │     False      │   False    │  ← conservative default
-  └─────────────────┴────────────────┴────────────┘
+MODE "dual"     : Run positive AND negative sequentially (no nested pool).
+                  Both run to full MAX_ITER — no early exit — full research logs.
+                  Priority: neg proves → False
+                            pos proves (neg failed) → True
+                            both fail → False (conservative default)
+
+Single output CSV with a `mode` column:
+    df[df["mode"] == "negative"]
+    df[df["mode"] == "dual"]
 """
 
 import os, re, sys, json, time
@@ -48,32 +54,59 @@ env_path = Path("/workspace/CS527-Project/.env")
 load_dotenv(dotenv_path=env_path)
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-VALIDATION_MODEL   = "openai/gpt-5-mini"
 
-# Set which modes to run in this execution
-# Remove either entry if you only want to run one mode
+MODEL       = "deepseek/deepseek-v4-flash"
+TEMPERATURE = 0.2
+
+VALIDATION_MODEL = "openai/gpt-5-mini"
+
 MODES = ["negative", "dual"]
-# negative means we will only generate the result for the negation of the property
-# dual is where we onlt predict 
+SEEDS = [42, 123, 999]
 
-DIRECT_MODELS = [
-    "openai/gpt-4.1-mini",
-    "google/gemini-3.1-flash-lite-preview",
-    "deepseek/deepseek-v4-flash",
-]
-TEMPERATURES  = [0.2, 0.5, 0.8]
-SEEDS         = [42, 123, 999]
-MAX_ITER      = 10
+MAX_ITER       = 10
 VERIFY_TIMEOUT = 120
-MAX_WORKERS   = 4
+MAX_WORKERS    = 4
 
 CSV_PATH   = "/workspace/CS527-Project/sample_df.csv"
 PROP_BASE  = "/workspace/sv-benchmarks/c/properties/"
-OUTPUT_DIR = "/workspace/CS527-Project/results/pipeline_neg_dual"
+OUTPUT_DIR = "/workspace/CS527-Project/results/final/pipeline_neg_dual"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-TEST_MODE = True
+TEST_MODE = False
 TEST_N    = 2
+
+# ==============================================================================
+# DEEPSEEK-SPECIFIC API CONFIGURATION
+#
+# include_reasoning=False:
+#   DeepSeek V4 Flash is a hybrid reasoning model. By default OpenRouter
+#   includes the <think>...</think> block in the response — this can be
+#   50,000-600,000 tokens per call, making each call take 10-60 minutes.
+#   Setting include_reasoning=False strips the think block from the OUTPUT.
+#   The model still reasons internally — quality is preserved.
+#   tokens_out drops from ~50k → ~2k per call.
+#
+# Provider order:
+#   SiliconFlow = 68 tps  (fastest)
+#   NovitaAI   = 63 tps
+#   AtlasCloud  = 63 tps
+#   Parasail    = 20 tps  ← OpenRouter default can land here → 3min/call
+#   AkashML    = 13 tps  ← worst case → 1hr/call
+#
+# max_tokens=None:
+#   Let streaming early-stop handle termination.
+#   Setting 32k would truncate reasoning before the proof appears.
+# ==============================================================================
+
+DEEPSEEK_EXTRA_BODY = {
+    "provider": {
+        "order": ["SiliconFlow", "NovitaAI", "AtlasCloud"],
+        "allow_fallbacks": True,
+    },
+    "include_reasoning": False,
+}
+
+END_MARKER = "===END LEAN PROOF==="
 
 # ==============================================================================
 # SPEC TYPE DETECTION
@@ -81,16 +114,13 @@ TEST_N    = 2
 
 def detect_spec_type(prop_text: str) -> str:
     p = prop_text.lower()
-    if "overflow" in p:
-        return "overflow"
-    if "reach_error" in p or "unreach-call" in p:
-        return "unreach-call"
-    if "termination" in p or "ltl(f end)" in p:
-        return "termination"
+    if "overflow"    in p:                        return "overflow"
+    if "reach_error" in p or "unreach-call" in p: return "unreach-call"
+    if "termination" in p or "ltl(f end)"   in p: return "termination"
     return "unknown"
 
 # ==============================================================================
-# PROPERTY PARAPHRASING  (positive — unchanged from pipeline1)
+# PROPERTY PARAPHRASING
 # ==============================================================================
 
 def paraphrase_property(prop_text: str) -> str:
@@ -117,8 +147,7 @@ def paraphrase_property(prop_text: str) -> str:
     return f"Prove using Lean 4 and Mathlib that the program satisfies: {prop_text.strip()}"
 
 
-def negate_property(prop_text: str, spec_type: str) -> str:
-    """Natural language description of the NEGATED property."""
+def negate_property(spec_type: str) -> str:
     if spec_type == "overflow":
         return (
             "Disprove the no-overflow property: show this C program DOES cause "
@@ -131,13 +160,13 @@ def negate_property(prop_text: str, spec_type: str) -> str:
         )
     if spec_type == "termination":
         return (
-            "Disprove termination: show this C program can fail to terminate "
-            "(find concrete inputs making the loop run at least 10,000 iterations)."
+            "Disprove termination: show this C program can fail to terminate — "
+            "find concrete inputs making the loop run at least 10,000 iterations."
         )
-    return f"Disprove: {prop_text.strip()}"
+    return "Disprove the specification by finding a concrete counterexample."
 
 # ==============================================================================
-# LEAN EXTRACTION  (identical to pipeline1)
+# LEAN EXTRACTION + FIXES
 # ==============================================================================
 
 def extract_proof(text: str) -> str:
@@ -167,7 +196,7 @@ def rule_based_fixes(code: str) -> str:
     return code
 
 # ==============================================================================
-# POSITIVE PROMPTS  (unchanged from pipeline1)
+# POSITIVE PROMPTS
 # ==============================================================================
 
 POSITIVE_SYSTEM = (
@@ -189,10 +218,7 @@ def positive_initial_user(c_code: str, prop_nl: str) -> str:
         f"### Task\n{prop_nl}\n\n"
         f"### C Code\n```c\n{c_code}\n```\n\n"
         "Write your complete, sorry-free Lean 4 proof between the delimiters:\n"
-        "===BEGIN LEAN PROOF===\n"
-        "import Mathlib\n"
-        "-- proof here\n"
-        "===END LEAN PROOF==="
+        "===BEGIN LEAN PROOF===\nimport Mathlib\n-- proof\n===END LEAN PROOF==="
     )
 
 
@@ -211,12 +237,11 @@ def positive_repair_user(lean_code: str, result: dict, iteration: int) -> str:
         ]
         parts.append(
             "#### Incomplete Proof (`sorry`)\nClose every sorry.\n"
-            "Remaining goals:\n" + "\n".join(blocks) + "\n\n"
+            "Goals:\n" + "\n".join(blocks) + "\n\n"
             "Tactics: `omega` · `ring` · `linarith` · `norm_num` · `decide` · `simp [*]`"
         )
     if not parts:
         parts.append("#### Proof Incomplete\nVerification failed.")
-
     return (
         f"### Compiler Feedback — Iteration {iteration}/{MAX_ITER}\n\n"
         + "\n\n".join(parts)
@@ -225,16 +250,8 @@ def positive_repair_user(lean_code: str, result: dict, iteration: int) -> str:
         "===BEGIN LEAN PROOF===\n<corrected proof>\n===END LEAN PROOF==="
     )
 
-
-def no_delimiter_msg(iteration: int) -> str:
-    return (
-        f"### Iteration {iteration} — Missing Delimiters\n"
-        "Wrap your entire proof exactly like this:\n"
-        "===BEGIN LEAN PROOF===\nimport Mathlib\n-- proof\n===END LEAN PROOF==="
-    )
-
 # ==============================================================================
-# NEGATIVE PROMPTS  (new — spec-type aware)
+# NEGATIVE PROMPTS
 # ==============================================================================
 
 NEGATIVE_SYSTEM = (
@@ -259,81 +276,59 @@ _NEGATION_APPROACH = {
 Show this C program DOES cause signed integer overflow for at least one input.
 
 ### Approach
-1. Identify which arithmetic operation could overflow (e.g. addition, subtraction, n++)
-2. Find CONCRETE integer values for the input variables that trigger the overflow
+1. Identify which arithmetic operation could overflow
+2. Find CONCRETE integer values that trigger the overflow
 3. Show the result exceeds INT_MAX (2147483647) or is below INT_MIN (-2147483648)
 
 ### Lean 4 Structure
 ```lean4
 import Mathlib
-
 def INT_MIN : Int := -2147483648
 def INT_MAX : Int :=  2147483647
-
--- Substitute your concrete witness values below
+-- Replace WITNESS_VALUE and ADDEND with actual values from the C code
 theorem overflow_witness :
-    -- example: with input a = X, the computation a + Y overflows
-    (WITNESS_VALUE : Int) + (ADDEND : Int) > INT_MAX := by
-  norm_num
-```
-Use norm_num or decide to close the arithmetic goal.
-Adjust the theorem to match the ACTUAL arithmetic in the C code above.""",
+    (WITNESS_VALUE : Int) + (ADDEND : Int) > INT_MAX := by norm_num
+```""",
 
     "unreach-call": """\
 ### What to Prove
 Show reach_error() CAN be called — find a concrete execution path to it.
 
 ### Approach
-1. Read the C code and find the guard condition protecting reach_error()
-2. Find CONCRETE input values satisfying that guard condition
-3. Show those values make the guard true in Lean 4
+1. Find the guard condition protecting reach_error() in the C code
+2. Find CONCRETE input values satisfying that guard
+3. Prove those values make the guard true in Lean 4
 
 ### Lean 4 Structure
 ```lean4
 import Mathlib
-
--- Concrete witness: with input x = WITNESS, the guard is satisfied
--- and execution reaches reach_error()
+-- Replace WITNESS_VALUE and the condition with the ACTUAL guard from the C code
 theorem reach_error_reachable :
-    -- e.g. if guard is (x < 0), show your witness satisfies it
-    (WITNESS_VALUE : Int) < 0 := by
-  norm_num
-```
-Replace WITNESS_VALUE and the condition with the ACTUAL guard from the C code.""",
+    (WITNESS_VALUE : Int) < 0 := by norm_num
+```""",
 
     "termination": """\
 ### What to Prove
 Show this C program can fail to terminate — find inputs making the loop run ≥ 10000 steps.
 
 ### Approach
-1. Model the loop body as a Lean 4 function with a fuel/step counter
+1. Model the loop body as a Lean 4 function
 2. Find CONCRETE initial values for the loop variables
-3. Show the loop still has x >= 0 after 10000 iterations with those inputs
+3. Show the loop condition stays true after 10000 iterations
 
 ### Lean 4 Structure
 ```lean4
 import Mathlib
-
--- Model one loop iteration
 def loopStep (x y : Int) : Int × Int := (x + y, (-2) * y - 1)
-
--- Apply N iterations
 def iterate : Nat → Int × Int → Int × Int
-  | 0,     state => state
-  | n + 1, state => iterate n (loopStep state.1 state.2)
-
--- Show concrete initial values keep the loop alive for 10000 steps
--- (i.e. x >= 0 after 10000 iterations applied to witness values)
+  | 0,     s => s
+  | n + 1, s => iterate n (loopStep s.1 s.2)
+-- Replace INIT_X and INIT_Y with concrete values
 theorem non_termination_witness :
-    (iterate 10000 (INIT_X, INIT_Y)).1 ≥ 0 := by
-  decide   -- or norm_num if decide is too slow
-```
-Replace INIT_X and INIT_Y with concrete integer values from the C code's input range.""",
+    (iterate 10000 (INIT_X, INIT_Y)).1 ≥ 0 := by decide
+```""",
 
-    "unknown": """\
-### What to Prove
-Find a concrete input for which the C program violates its specification.
-Exhibit the violation as a Lean 4 proof with concrete witness values.""",
+    "unknown": "Find a concrete input violating the specification. Exhibit it in Lean 4.",
 }
 
 
@@ -344,15 +339,11 @@ def negative_initial_user(c_code: str, neg_prop_nl: str, spec_type: str) -> str:
         f"### C Code\n```c\n{c_code}\n```\n\n"
         f"{approach}\n\n"
         "Write your complete, sorry-free violation proof between the delimiters:\n"
-        "===BEGIN LEAN PROOF===\n"
-        "import Mathlib\n"
-        "-- concrete violation proof here\n"
-        "===END LEAN PROOF==="
+        "===BEGIN LEAN PROOF===\nimport Mathlib\n-- violation proof\n===END LEAN PROOF==="
     )
 
 
 def negative_repair_user(lean_code: str, result: dict, iteration: int) -> str:
-    """Same structure as positive repair, with a reminder about the negation goal."""
     parts = []
     if result.get("errors"):
         rows = [
@@ -367,21 +358,27 @@ def negative_repair_user(lean_code: str, result: dict, iteration: int) -> str:
         ]
         parts.append(
             "#### Incomplete Proof (`sorry`)\nClose every sorry.\n"
-            "Remaining goals:\n" + "\n".join(blocks) + "\n\n"
+            "Goals:\n" + "\n".join(blocks) + "\n\n"
             "Tactics: `norm_num` · `decide` · `omega` · `native_decide`"
         )
     if not parts:
         parts.append("#### Proof Incomplete\nVerification failed.")
-
     return (
         f"### Compiler Feedback — Iteration {iteration}/{MAX_ITER}\n\n"
         + "\n\n".join(parts)
         + f"\n\n---\n### Previous Proof\n```lean\n{lean_code}\n```\n\n"
-        "**REMINDER**: You are proving a VIOLATION. You need concrete witness values "
-        "that demonstrate the property is broken. Try simpler/smaller witness values "
-        "if the current proof is too complex.\n\n"
+        "**REMINDER**: Prove a VIOLATION — exhibit concrete witness values.\n"
+        "Try simpler/smaller witnesses if the proof is getting complex.\n\n"
         "Fix ALL issues:\n"
         "===BEGIN LEAN PROOF===\n<corrected violation proof>\n===END LEAN PROOF==="
+    )
+
+
+def no_delimiter_msg(iteration: int) -> str:
+    return (
+        f"### Iteration {iteration} — Missing Delimiters\n"
+        "Wrap your proof exactly like this:\n"
+        "===BEGIN LEAN PROOF===\nimport Mathlib\n-- proof\n===END LEAN PROOF==="
     )
 
 # ==============================================================================
@@ -402,43 +399,90 @@ def validate_lean_with_bleu(lean_code: str, original_c: str, client: OpenAI) -> 
             }],
             temperature=0.0,
         )
-        regen  = resp.choices[0].message.content.strip()
-        c_m    = re.search(r"```(?:c|cpp)?\s*\n(.*?)```", regen, re.DOTALL)
-        regen  = c_m.group(1).strip() if c_m else regen
-        smooth = SmoothingFunction().method1
-        bleu   = sentence_bleu([original_c.split()], regen.split(), smoothing_function=smooth)
+        regen = resp.choices[0].message.content.strip()
+        c_m   = re.search(r"```(?:c|cpp)?\s*\n(.*?)```", regen, re.DOTALL)
+        regen = c_m.group(1).strip() if c_m else regen
+        bleu  = sentence_bleu(
+            [original_c.split()], regen.split(),
+            smoothing_function=SmoothingFunction().method1
+        )
         return {"bleu_score": round(bleu * 100, 2), "regenerated_c": regen, "bleu_ok": True}
     except Exception as exc:
         return {"bleu_score": -1.0, "regenerated_c": "", "bleu_ok": False,
                 "bleu_error": str(exc)}
 
 # ==============================================================================
-# GENERIC REPAIR LOOP  (shared by positive and negative pipelines)
+# STREAMING API CALL
+#
+# Streams tokens and closes the connection the moment END_MARKER appears.
+# This avoids waiting for any text the model generates after the proof block.
+#
+# For DeepSeek with include_reasoning=False:
+#   - <think> tokens stripped from output (still generated server-side)
+#   - Only the proof text is streamed to us
+#   - tokens_out ≈ 1k-5k instead of 50k-600k
+#   - Per-call time drops from ~60min (Parasail, no routing) to ~30-90s
+# ==============================================================================
+
+def _call_api(client: OpenAI, messages: list) -> tuple[str, int, int]:
+    """
+    Stream the response, closing connection at END_MARKER.
+    Returns (full_text_up_to_end_marker, prompt_tokens, completion_tokens).
+    """
+    content       = ""
+    prompt_tokens = 0
+    comp_tokens   = 0
+
+    with client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=TEMPERATURE,
+        stream=True,
+        # No max_tokens — streaming early-stop handles termination.
+        # Setting a hard limit risks cutting off reasoning before the proof appears.
+        extra_body=DEEPSEEK_EXTRA_BODY,
+    ) as stream:
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            content += delta
+
+            # Capture usage metadata when the server sends it
+            # (usually in the final chunk)
+            if hasattr(chunk, "usage") and chunk.usage:
+                prompt_tokens = chunk.usage.prompt_tokens
+                comp_tokens   = chunk.usage.completion_tokens
+
+            # Stop streaming the moment the proof closing delimiter appears
+            if END_MARKER in content:
+                break
+
+    # Fallback token estimate when the stream ended before the usage chunk arrived
+    if comp_tokens == 0:
+        comp_tokens = max(1, len(content) // 4)
+
+    return content, prompt_tokens, comp_tokens
+
+# ==============================================================================
+# GENERIC REPAIR LOOP  (shared by positive and negative — only prompts differ)
+# Full 10-iteration context preserved — no history trimming.
 # ==============================================================================
 
 def _run_repair_loop(
-    model: str,
-    temperature: float,
-    seed: int,
     client: OpenAI,
     system_prompt: str,
     initial_user_msg: str,
-    repair_fn,          # callable(lean_code, result, iteration) -> str
-    no_delim_fn,        # callable(iteration) -> str
+    repair_fn,       # (lean_code, result, iteration) -> str
+    no_delim_fn,     # (iteration) -> str
 ) -> dict:
-    """
-    Core repair loop used by both pipelines.
-    Prompts differ; loop structure is identical.
-    """
     t0         = time.time()
-    tokens_in  = 0
-    tokens_out = 0
+    tokens_in  = tokens_out = 0
     iter_log   = []
     success    = False
     success_it = -1
     final_code = ""
     feedback   = ""
 
+    # Full history — all 10 iterations stay in context (no trimming)
     history = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": initial_user_msg},
@@ -449,34 +493,22 @@ def _run_repair_loop(
             history.append({"role": "user", "content": feedback})
             feedback = ""
 
-        rec = {
-            "iteration"  : it,
-            "extracted"  : False,
-            "pass"       : False,
-            "complete"   : False,
-            "n_errors"   : 0,
-            "n_sorries"  : 0,
-            "tokens_in"  : 0,
-            "tokens_out" : 0,
-            "verify_time": 0.0,
-            "iter_time"  : 0.0,
-        }
+        rec   = {"iteration": it, "extracted": False, "pass": False,
+                 "complete": False, "n_errors": 0, "n_sorries": 0,
+                 "tokens_in": 0, "tokens_out": 0,
+                 "verify_time": 0.0, "iter_time": 0.0}
         it_t0 = time.time()
 
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=history,
-                temperature=temperature,
-                seed=seed,
-                # no max_tokens — let model decide
-            )
-            rec["tokens_in"]  = resp.usage.prompt_tokens
-            rec["tokens_out"] = resp.usage.completion_tokens
-            tokens_in        += resp.usage.prompt_tokens
-            tokens_out       += resp.usage.completion_tokens
+            # Streaming call — stops at END_MARKER, routes to SiliconFlow,
+            # strips reasoning tokens from output
+            raw, tok_in, tok_out = _call_api(client, history)
 
-            raw = resp.choices[0].message.content
+            rec["tokens_in"]  = tok_in
+            rec["tokens_out"] = tok_out
+            tokens_in        += tok_in
+            tokens_out       += tok_out
+
             history.append({"role": "assistant", "content": raw})
 
             lean = extract_proof(raw)
@@ -510,7 +542,7 @@ def _run_repair_loop(
             feedback = repair_fn(lean, v, it)
 
         except Exception as exc:
-            rec["error"]   = str(exc)
+            rec["error"] = str(exc)
             feedback = (
                 f"### System Error at Iteration {it}\n```\n{exc}\n```\n"
                 "Please provide a fresh attempt."
@@ -532,43 +564,26 @@ def _run_repair_loop(
     }
 
 # ==============================================================================
-# POSITIVE PIPELINE
+# NAMED PIPELINES
 # ==============================================================================
 
-def run_positive_pipeline(
-    c_code: str,
-    prop_nl: str,
-    model: str,
-    temperature: float,
-    seed: int,
-    client: OpenAI,
-) -> dict:
+def run_positive_pipeline(c_code: str, prop_nl: str, client: OpenAI) -> dict:
     return _run_repair_loop(
-        model=model, temperature=temperature, seed=seed, client=client,
+        client           = client,
         system_prompt    = POSITIVE_SYSTEM,
         initial_user_msg = positive_initial_user(c_code, prop_nl),
         repair_fn        = positive_repair_user,
         no_delim_fn      = no_delimiter_msg,
     )
 
-# ==============================================================================
-# NEGATIVE PIPELINE
-# ==============================================================================
 
-def run_negative_pipeline(
-    c_code: str,
-    prop_nl: str,
-    spec_type: str,
-    model: str,
-    temperature: float,
-    seed: int,
-    client: OpenAI,
-) -> dict:
-    neg_prop_nl = negate_property(prop_nl, spec_type)
+def run_negative_pipeline(c_code: str, prop_nl: str, spec_type: str,
+                           client: OpenAI) -> dict:
+    neg_nl = negate_property(spec_type)
     return _run_repair_loop(
-        model=model, temperature=temperature, seed=seed, client=client,
+        client           = client,
         system_prompt    = NEGATIVE_SYSTEM,
-        initial_user_msg = negative_initial_user(c_code, neg_prop_nl, spec_type),
+        initial_user_msg = negative_initial_user(c_code, neg_nl, spec_type),
         repair_fn        = negative_repair_user,
         no_delim_fn      = no_delimiter_msg,
     )
@@ -577,52 +592,26 @@ def run_negative_pipeline(
 # PREDICTION LOGIC
 # ==============================================================================
 
-def determine_prediction(mode: str, pos_result: dict, neg_result: dict) -> bool:
-    """
-    mode = "negative":
-        neg proves violation → False  (confirmed violation)
-        neg fails            → True   (couldn't disprove → assume it holds)
-
-    mode = "dual":
-        neg proves           → False  (trust negative, even if pos also proved)
-        pos proves, neg fails→ True
-        both fail            → False  (conservative default)
-    """
+def determine_prediction(mode: str, pos: dict, neg: dict) -> bool:
     if mode == "negative":
-        return not neg_result["success"]  # True = "couldn't disprove"
-
+        return not neg["success"]   # True = couldn't disprove
     if mode == "dual":
-        if neg_result["success"]:
-            return False
-        if pos_result["success"]:
-            return True
-        return False  # both failed → default False
-
+        if neg["success"]:  return False
+        if pos["success"]:  return True
+        return False                # both failed → conservative default
     raise ValueError(f"Unknown mode: {mode}")
 
-# ==============================================================================
-# EMPTY RESULT PLACEHOLDER
-# ==============================================================================
 
 def _empty_result() -> dict:
-    """Placeholder for the unused pipeline in mode='negative'."""
-    return {
-        "success"     : None,
-        "success_it"  : None,
-        "total_iters" : None,
-        "tokens_in"   : None,
-        "tokens_out"  : None,
-        "total_tokens": None,
-        "duration_sec": None,
-        "final_code"  : None,
-        "iter_log"    : [],
-        "bleu_score"  : None,
-        "regenerated_c": None,
-        "bleu_ok"     : None,
-    }
+    return {k: None for k in [
+        "success", "success_it", "total_iters",
+        "tokens_in", "tokens_out", "total_tokens",
+        "duration_sec", "final_code", "iter_log",
+        "bleu_score", "regenerated_c", "bleu_ok",
+    ]}
 
 # ==============================================================================
-# CORE DISPATCHER  (one mode × model × temperature × seed)
+# CORE DISPATCHER  (one mode × one seed)
 # ==============================================================================
 
 def run_single(
@@ -630,160 +619,115 @@ def run_single(
     prop_nl: str,
     spec_type: str,
     mode: str,
-    model: str,
-    temperature: float,
     seed: int,
 ) -> dict:
-    """
-    Dispatches to the correct pipeline(s) based on mode.
-    Returns a unified result dict with pos_* and neg_* prefixed columns.
-    """
+    # Separate client per call — thread-safe, 120s hard timeout per HTTP request
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
     )
-
     t0 = time.time()
 
     if mode == "negative":
-        # ── Negative only ──────────────────────────────────────────────────────
-        neg = run_negative_pipeline(c_code, prop_nl, spec_type, model, temperature, seed, client)
+        neg = run_negative_pipeline(c_code, prop_nl, spec_type, client)
         pos = _empty_result()
-        prediction = determine_prediction("negative", pos, neg)
 
     elif mode == "dual":
-        # ── Both in parallel, full 10 iterations each ──────────────────────────
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            pos_fut = ex.submit(
-                run_positive_pipeline,
-                c_code, prop_nl, model, temperature, seed, client
-            )
-            neg_fut = ex.submit(
-                run_negative_pipeline,
-                c_code, prop_nl, spec_type, model, temperature, seed, client
-            )
-            pos = pos_fut.result()
-            neg = neg_fut.result()
-        prediction = determine_prediction("dual", pos, neg)
+        # Sequential — avoids nested thread pool deadlock.
+        # Positive first, then negative.
+        # Outer flat pool handles sample-level parallelism.
+        pos = run_positive_pipeline(c_code, prop_nl, client)
+        neg = run_negative_pipeline(c_code, prop_nl, spec_type, client)
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    # ── BLEU validation (run after loop, only when pipeline succeeded) ─────────
+    prediction = determine_prediction(mode, pos, neg)
+
     if pos.get("success") and pos.get("final_code"):
         pos.update(validate_lean_with_bleu(pos["final_code"], c_code, client))
-    else:
-        pos.update({"bleu_score": None, "regenerated_c": None, "bleu_ok": None})
-
     if neg.get("success") and neg.get("final_code"):
         neg.update(validate_lean_with_bleu(neg["final_code"], c_code, client))
-    else:
-        neg.update({"bleu_score": None, "regenerated_c": None, "bleu_ok": None})
+
+    def _jlog(d, k):
+        v = d.get(k)
+        return json.dumps(v) if isinstance(v, list) else v
 
     return {
-        # ── Metadata ─────────────────────────────────────────────────────────
-        "mode"        : mode,
-        "model"       : model,
-        "temperature" : temperature,
-        "seed"        : seed,
-        "spec_type"   : spec_type,
-        "prediction"  : prediction,
-        # ── Positive pipeline ─────────────────────────────────────────────────
-        "pos_success"      : pos["success"],
-        "pos_success_it"   : pos["success_it"],
-        "pos_total_iters"  : pos["total_iters"],
-        "pos_tokens_in"    : pos["tokens_in"],
-        "pos_tokens_out"   : pos["tokens_out"],
-        "pos_total_tokens" : pos["total_tokens"],
-        "pos_duration_sec" : pos["duration_sec"],
-        "pos_final_code"   : pos["final_code"],
-        "pos_bleu_score"   : pos.get("bleu_score"),
-        "pos_regenerated_c": pos.get("regenerated_c"),
-        "pos_iter_log"     : json.dumps(pos["iter_log"]),
-        # ── Negative pipeline ─────────────────────────────────────────────────
-        "neg_success"      : neg["success"],
-        "neg_success_it"   : neg["success_it"],
-        "neg_total_iters"  : neg["total_iters"],
-        "neg_tokens_in"    : neg["tokens_in"],
-        "neg_tokens_out"   : neg["tokens_out"],
-        "neg_total_tokens" : neg["total_tokens"],
-        "neg_duration_sec" : neg["duration_sec"],
-        "neg_final_code"   : neg["final_code"],
-        "neg_bleu_score"   : neg.get("bleu_score"),
-        "neg_regenerated_c": neg.get("regenerated_c"),
-        "neg_iter_log"     : json.dumps(neg["iter_log"]),
-        # ── Totals ────────────────────────────────────────────────────────────
-        "total_tokens"     : (pos.get("total_tokens") or 0) + (neg.get("total_tokens") or 0),
+        "mode"              : mode,
+        "model"             : MODEL,
+        "temperature"       : TEMPERATURE,
+        "seed"              : seed,
+        "spec_type"         : spec_type,
+        "prediction"        : prediction,
+        "pos_success"       : pos.get("success"),
+        "pos_success_it"    : pos.get("success_it"),
+        "pos_total_iters"   : pos.get("total_iters"),
+        "pos_tokens_in"     : pos.get("tokens_in"),
+        "pos_tokens_out"    : pos.get("tokens_out"),
+        "pos_total_tokens"  : pos.get("total_tokens"),
+        "pos_duration_sec"  : pos.get("duration_sec"),
+        "pos_final_code"    : pos.get("final_code"),
+        "pos_bleu_score"    : pos.get("bleu_score"),
+        "pos_regenerated_c" : pos.get("regenerated_c"),
+        "pos_iter_log"      : json.dumps(_jlog(pos, "iter_log") or []),
+        "neg_success"       : neg.get("success"),
+        "neg_success_it"    : neg.get("success_it"),
+        "neg_total_iters"   : neg.get("total_iters"),
+        "neg_tokens_in"     : neg.get("tokens_in"),
+        "neg_tokens_out"    : neg.get("tokens_out"),
+        "neg_total_tokens"  : neg.get("total_tokens"),
+        "neg_duration_sec"  : neg.get("duration_sec"),
+        "neg_final_code"    : neg.get("final_code"),
+        "neg_bleu_score"    : neg.get("bleu_score"),
+        "neg_regenerated_c" : neg.get("regenerated_c"),
+        "neg_iter_log"      : json.dumps(_jlog(neg, "iter_log") or []),
+        "total_tokens"      : (pos.get("total_tokens") or 0) +
+                              (neg.get("total_tokens") or 0),
         "total_duration_sec": round(time.time() - t0, 2),
     }
 
 # ==============================================================================
-# SAMPLE PROCESSOR
+# FLAT COMBO RUNNER  (no nested thread pools)
 # ==============================================================================
 
-def process_sample(item) -> list[dict]:
-    """
-    For one CSV row, run all (mode × model × temperature × seed) combos in parallel.
-    Returns one result dict per combo.
-    """
-    idx, row = item
+def run_one_combo(idx: int, row: pd.Series, mode: str, seed: int) -> dict | None:
     try:
         with open(row["c_file_abs"]) as f:
             c_code = f.read()
         with open(f"{PROP_BASE}{row['property']}.prp") as fh:
             prop_raw = fh.read()
     except Exception as exc:
-        tqdm.write(f"  [SKIP] idx={idx}: {exc}")
-        return []
+        tqdm.write(f"  [SKIP] idx={idx} {mode} seed={seed}: {exc}")
+        return None
 
     prop_nl   = paraphrase_property(prop_raw)
     spec_type = detect_spec_type(prop_raw)
 
-    combos = [
-        (mode, model, temp, seed)
-        for mode  in MODES
-        for model in DIRECT_MODELS
-        for temp  in TEMPERATURES
-        for seed  in SEEDS
-    ]
-
-    results = []
-    with ThreadPoolExecutor(max_workers=min(len(combos), 12)) as ex:
-        futs = {
-            ex.submit(run_single, c_code, prop_nl, spec_type, mo, mdl, t, s): (mo, mdl, t, s)
-            for mo, mdl, t, s in combos
+    try:
+        r = run_single(c_code, prop_nl, spec_type, mode, seed)
+    except Exception as exc:
+        tqdm.write(f"  [ERROR] idx={idx} {mode} seed={seed}: {exc}")
+        r = {
+            "mode": mode, "model": MODEL, "temperature": TEMPERATURE,
+            "seed": seed, "spec_type": spec_type, "prediction": False,
+            **{f"pos_{k}": None for k in [
+                "success","success_it","total_iters","tokens_in",
+                "tokens_out","total_tokens","duration_sec","final_code",
+                "bleu_score","regenerated_c","iter_log"]},
+            **{f"neg_{k}": None for k in [
+                "success","success_it","total_iters","tokens_in",
+                "tokens_out","total_tokens","duration_sec","final_code",
+                "bleu_score","regenerated_c","iter_log"]},
+            "total_tokens": None, "total_duration_sec": None,
+            "error": str(exc),
         }
-        for fut in as_completed(futs):
-            mo, mdl, t, s = futs[fut]
-            try:
-                r = fut.result()
-            except Exception as exc:
-                r = {
-                    "mode": mo, "model": mdl, "temperature": t, "seed": s,
-                    "spec_type": spec_type, "prediction": False,
-                    "pos_success": None, "pos_success_it": None,
-                    "pos_total_iters": None, "pos_tokens_in": None,
-                    "pos_tokens_out": None, "pos_total_tokens": None,
-                    "pos_duration_sec": None, "pos_final_code": None,
-                    "pos_bleu_score": None, "pos_regenerated_c": None,
-                    "pos_iter_log": "[]",
-                    "neg_success": None, "neg_success_it": None,
-                    "neg_total_iters": None, "neg_tokens_in": None,
-                    "neg_tokens_out": None, "neg_total_tokens": None,
-                    "neg_duration_sec": None, "neg_final_code": None,
-                    "neg_bleu_score": None, "neg_regenerated_c": None,
-                    "neg_iter_log": "[]",
-                    "total_tokens": None, "total_duration_sec": None,
-                    "error": str(exc),
-                }
 
-            r["sample_idx"]       = idx
-            r["c_file"]           = row.get("c_file_abs", "")
-            r["property"]         = row.get("property", "")
-            r["expected_verdict"] = row.get("expected_verdict", "")
-            results.append(r)
-
-    return results
+    r["sample_idx"]       = idx
+    r["c_file"]           = row.get("c_file_abs", "")
+    r["property"]         = row.get("property", "")
+    r["expected_verdict"] = row.get("expected_verdict", "")
+    return r
 
 # ==============================================================================
 # MAIN
@@ -794,72 +738,92 @@ def main():
     df = pd.read_csv(CSV_PATH)
 
     if TEST_MODE:
-        df = df.query("expected_verdict == True").sample(TEST_N, random_state=42)
+        a = df.query("expected_verdict == True").sample(1, random_state=42)
+        b = df.query("expected_verdict == False").sample(1, random_state=42)
+        df = pd.concat([a,b])
         print(f"[TEST MODE] {TEST_N} samples")
 
-    samples   = list(df.iterrows())
-    n_combos  = len(MODES) * len(DIRECT_MODELS) * len(TEMPERATURES) * len(SEEDS)
+    samples = list(df.iterrows())
+
+    # All combos upfront — flat, no nesting
+    all_combos = [
+        (idx, row, mode, seed)
+        for idx, row in samples
+        for mode in MODES
+        for seed in SEEDS
+    ]
+    n_total   = len(all_combos)
     ckpt_path = os.path.join(OUTPUT_DIR, "checkpoint.csv")
 
-    print(f"[INFO] Modes          : {MODES}")
-    print(f"[INFO] Models         : {DIRECT_MODELS}")
-    print(f"[INFO] Temperatures   : {TEMPERATURES}")
-    print(f"[INFO] Seeds          : {SEEDS}")
-    print(f"[INFO] Max iter each  : {MAX_ITER}  "
-          f"(dual = up to {MAX_ITER * 2} total per combo)")
-    print(
-        f"[INFO] {len(samples)} samples × {n_combos} combos = "
-        f"{len(samples) * n_combos} total runs"
-    )
-    print(f"[INFO] Output → {OUTPUT_DIR}\n")
+    print(f"[INFO]  Model              : {MODEL}")
+    print(f"[INFO]  Temperature        : {TEMPERATURE}")
+    print(f"[INFO]  Provider routing   : SiliconFlow → NovitaAI → AtlasCloud")
+    print(f"[INFO]  include_reasoning  : False  (think tokens stripped from output)")
+    print(f"[INFO]  Streaming early stop at: {END_MARKER!r}")
+    print(f"[INFO]  History            : full (no trimming, all {MAX_ITER} iters in context)")
+    print(f"[INFO]  Modes              : {MODES}")
+    print(f"[INFO]  Seeds              : {SEEDS}")
+    print(f"[INFO]  Max iter each      : {MAX_ITER}  "
+          f"(dual = {MAX_ITER} pos + {MAX_ITER} neg sequential)")
+    print(f"[INFO]  Total combos       : {n_total}  "
+          f"({len(samples)} samples × {len(MODES)} modes × {len(SEEDS)} seeds)")
+    print(f"[INFO]  Workers            : {MAX_WORKERS}  (flat pool, no nested pools)")
+    print(f"[INFO]  Output             : {OUTPUT_DIR}\n")
 
     all_rows: list[dict] = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(process_sample, s): s for s in samples}
-        for fut in tqdm(as_completed(futs), total=len(samples),
-                        desc="Samples", unit="sample"):
-            rows = fut.result()
-            all_rows.extend(rows)
-            if len(all_rows) % (5 * n_combos) == 0 and all_rows:
+        futs = {
+            ex.submit(run_one_combo, idx, row, mode, seed): (idx, mode, seed)
+            for idx, row, mode, seed in all_combos
+        }
+
+        for fut in tqdm(as_completed(futs), total=n_total,
+                        desc="Combos", unit="combo"):
+            idx, mode, seed = futs[fut]
+            try:
+                r = fut.result(timeout=7200)   # 2hr hard cap per combo (20 iters × dual)
+            except TimeoutError:
+                tqdm.write(f"  [TIMEOUT] idx={idx} {mode} seed={seed} exceeded 2hr")
+                r = None
+            except Exception as exc:
+                tqdm.write(f"  [FUTURE ERROR] idx={idx} {mode} seed={seed}: {exc}")
+                r = None
+
+            if r:
+                all_rows.append(r)
+                tqdm.write(
+                    f"  ✓ idx={idx:4d} | {mode:8s} | seed={seed} | "
+                    f"pred={r.get('prediction')} | "
+                    f"pos_ok={r.get('pos_success')} | "
+                    f"neg_ok={r.get('neg_success')} | "
+                    f"tokens={r.get('total_tokens','?')} | "
+                    f"time={r.get('total_duration_sec','?')}s"
+                )
+
+            if len(all_rows) % 10 == 0 and all_rows:
                 pd.DataFrame(all_rows).to_csv(ckpt_path, index=False)
-                tqdm.write(f"  [ckpt] {len(all_rows)} rows saved")
 
     out = os.path.join(OUTPUT_DIR, "final_results.csv")
     pd.DataFrame(all_rows).to_csv(out, index=False)
-    print(f"\n[Done] {(time.time()-t0)/3600:.2f}h | {len(all_rows)} rows → {out}")
+    elapsed = (time.time() - t0) / 3600
+    print(f"\n[Done] {elapsed:.2f}h | {len(all_rows)} rows → {out}")
+
+    df_out = pd.read_csv(out)
+    print("\n── Quick Summary ────────────────────────────────────")
+    for m in MODES:
+        sub = df_out[df_out["mode"] == m]
+        if len(sub) == 0:
+            continue
+        pct  = sub["prediction"].mean() * 100
+        pos_ok = sub["pos_success"].sum() if "pos_success" in sub else "N/A"
+        neg_ok = sub["neg_success"].sum()
+        print(
+            f"  {m:10s}: {len(sub):4d} rows | "
+            f"predicted True={pct:.1f}% | "
+            f"pos proved={pos_ok} | neg proved={neg_ok}"
+        )
 
 
 if __name__ == "__main__":
     main()
-# ```
-
-# ---
-
-# ## Summary of What Was Built
-
-# # ```
-# # _run_repair_loop()          ← single generic loop, takes prompt fns as args
-# #        │
-# #        ├── run_positive_pipeline()   uses POSITIVE_SYSTEM + positive_* prompts
-# #        │
-# #        └── run_negative_pipeline()   uses NEGATIVE_SYSTEM + negative_* prompts
-# #                                      spec-type-aware approach per violation type
-
-# # run_single(mode=...)
-# #        │
-# #        ├── "negative"  → run_negative only  → determine_prediction → True/False
-# #        │
-# #        └── "dual"      → ThreadPoolExecutor(2) runs both in parallel
-# #                           both run FULL 10 iterations independently
-# #                           no cancellation → full logs captured for analysis
-# #                           → determine_prediction → priority: neg > pos > False
-# # ```
-
-# | Column group | present in `negative` | present in `dual` |
-# |---|---|---|
-# | `pos_*` | `None` (not run) | ✅ filled |
-# | `neg_*` | ✅ filled | ✅ filled |
-# | `pos_bleu_score` | `None` | ✅ if pos succeeded |
-# | `neg_bleu_score` | ✅ if neg succeeded | ✅ if neg succeeded |
-# | `prediction` | `not neg_success` | priority table |
